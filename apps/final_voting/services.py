@@ -9,7 +9,7 @@ def category_ready(category):
 
 
 def division_complete(division):
-    return division.candidates.filter(confirmed=True).exclude(name__iexact='TO BE CONFIRMED').count() >= division.required_candidates
+    return division.candidates.filter(confirmed=True).exclude(name__iexact='TO BE CONFIRMED').exists()
 
 
 def category_complete(category):

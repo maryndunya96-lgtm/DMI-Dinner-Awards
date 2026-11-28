@@ -9,7 +9,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 from .models import Election, BallotCategory, BallotDivision, Candidate, Ballot, VoteSelection, VotingAudit
-from .services import category_complete, category_ready, published_categories
+from .services import category_ready, published_categories
 
 
 @login_required
@@ -79,7 +79,7 @@ def submit_ballot(request):
 def manage_view(request):
     election = Election.current()
     categories = BallotCategory.objects.prefetch_related('divisions__candidates').order_by('display_order')
-    readiness = {category.pk: category_complete(category) for category in categories}
+    readiness = {category.pk: category_ready(category) for category in categories}
     confirmed_counts = {
         division.pk: sum(candidate.confirmed and candidate.name.strip().casefold() != 'to be confirmed' for candidate in division.candidates.all())
         for category in categories for division in category.divisions.all()
