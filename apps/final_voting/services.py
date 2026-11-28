@@ -3,23 +3,30 @@ from .models import BallotCategory
 
 
 def category_ready(category):
-    return category.method == 'online' and category.approved and category_complete(category)
+    return category.method == 'online' and category.approved and any(
+        division_complete(division) for division in category.divisions.all()
+    )
+
+
+def division_complete(division):
+    return division.candidates.filter(confirmed=True).exclude(name__iexact='TO BE CONFIRMED').count() >= division.required_candidates
 
 
 def category_complete(category):
     if category.method != 'online':
         return False
     divisions = list(category.divisions.prefetch_related('candidates'))
-    return bool(divisions) and all(
-        d.candidates.count() == d.required_candidates
-        and d.candidates.filter(confirmed=True).count() == d.required_candidates
-        and not d.candidates.filter(name__iexact='TO BE CONFIRMED').exists()
-        for d in divisions
-    )
+    return bool(divisions) and all(division_complete(division) for division in divisions)
 
 
 def published_categories():
-    return [c for c in BallotCategory.objects.filter(method='online', approved=True).prefetch_related('divisions__candidates').order_by('display_order') if category_ready(c)]
+    categories = []
+    for category in BallotCategory.objects.filter(method='online', approved=True).prefetch_related('divisions__candidates').order_by('display_order'):
+        ready_divisions = [division for division in category.divisions.all() if division_complete(division)]
+        if ready_divisions:
+            category._prefetched_objects_cache['divisions'] = ready_divisions
+            categories.append(category)
+    return categories
 
 
 def category_results(category):

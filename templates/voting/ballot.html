@@ -32,6 +32,7 @@
         <p class="text-neutral-400 mt-2">Tap a candidate card to select one person or complete pair in each division.</p>
     </div>
     {% if preview %}<p class="mb-5 rounded border border-amber-500/30 p-3 text-amber-300">Administrator preview · selections are disabled.</p>{% endif %}
+    {% if existing_ballot and not election.allow_ballot_edits %}<p class="mb-5 rounded border border-emerald-500/30 p-3 text-emerald-200">Your earlier votes are locked. You can vote in any newly released categories below without changing those votes.</p>{% endif %}
     {% if categories %}
     <form method="post" action="{% url 'final_voting:submit' %}">
         {% csrf_token %}
@@ -45,7 +46,7 @@
                     {% for candidate in division.candidates.all %}
                         {% if candidate.confirmed %}
                         <label class="vote-option relative">
-                            <input class="vote-radio" type="radio" {% if preview %}disabled{% endif %} name="division_{{ division.id }}" value="{{ candidate.id }}" {% if selected|get_item:division.id == candidate.id %}checked{% endif %} required>
+                            <input class="vote-radio" type="radio" {% if preview or existing_ballot and not election.allow_ballot_edits and division.id not in new_division_ids %}disabled{% endif %} name="division_{{ division.id }}" value="{{ candidate.id }}" {% if selected|get_item:division.id == candidate.id %}checked{% endif %} required>
                             <span class="vote-card">
                                 <span class="candidate-avatar" aria-hidden="true">{{ candidate.name|voting_initials }}</span>
                                 <span class="candidate-name">{{ candidate.name }}</span>
@@ -59,7 +60,7 @@
             {% endfor %}
         </article>
         {% endfor %}
-        {% if not preview %}<div class="sticky bottom-0 py-4 bg-neutral-950/95"><button class="w-full sm:w-auto rounded-full bg-amber-500 px-8 py-3 font-bold text-neutral-950 hover:bg-amber-400">Submit my final ballot</button></div>{% endif %}
+        {% if not preview %}{% if not existing_ballot or election.allow_ballot_edits or new_division_ids %}<div class="sticky bottom-0 py-4 bg-neutral-950/95"><button class="w-full sm:w-auto rounded-full bg-amber-500 px-8 py-3 font-bold text-neutral-950 hover:bg-amber-400">{% if existing_ballot and not election.allow_ballot_edits %}Submit votes for new categories{% else %}Submit my final ballot{% endif %}</button></div>{% endif %}{% endif %}
     </form>
     {% else %}
     <p class="rounded-xl border border-neutral-700 p-6 text-neutral-300">The approved final ballot is being prepared. Please check back when voting is open.</p>

@@ -18,11 +18,10 @@ def ballot_view(request):
     if election.status != 'open':
         return render(request, 'voting/closed.html', {'election': election})
     existing = Ballot.objects.filter(voter=request.user).first()
-    if existing and not election.allow_ballot_edits:
-        return render(request, 'voting/already_voted.html', {'ballot': existing})
     categories = published_categories()
     selected = {s.division_id: s.candidate_id for s in existing.selections.all()} if existing else {}
-    return render(request, 'voting/ballot.html', {'categories': categories, 'selected': selected, 'election': election})
+    new_division_ids = {d.pk for c in categories for d in c.divisions.all()} - set(selected)
+    return render(request, 'voting/ballot.html', {'categories': categories, 'selected': selected, 'election': election, 'existing_ballot': existing, 'new_division_ids': new_division_ids})
 
 
 @login_required
@@ -34,9 +33,14 @@ def submit_ballot(request):
         return redirect('final_voting:ballot')
     categories = published_categories()
     divisions = [d for c in categories for d in c.divisions.all()]
+    ballot = Ballot.objects.filter(voter=request.user).first()
+    existing_selections = {selection.division_id: selection.candidate for selection in ballot.selections.select_related('candidate')} if ballot else {}
     submitted = {}
     for division in divisions:
         value = request.POST.get(f'division_{division.pk}')
+        if division.pk in existing_selections and not election.allow_ballot_edits:
+            submitted[division.pk] = existing_selections[division.pk]
+            continue
         if not value:
             messages.error(request, f'Please make one selection for {division}.')
             return redirect('final_voting:ballot')
@@ -45,6 +49,10 @@ def submit_ballot(request):
             messages.error(request, 'One or more selections are not valid for this ballot.')
             return redirect('final_voting:ballot')
         submitted[division.pk] = candidate
+    new_submissions = {division_id: candidate for division_id, candidate in submitted.items() if division_id not in existing_selections}
+    if not new_submissions and ballot and not election.allow_ballot_edits:
+        messages.info(request, 'Your recorded votes are locked. There are no newly released categories to vote in yet.')
+        return redirect('final_voting:ballot')
     if not divisions:
         messages.error(request, 'The approved ballot is not ready yet.')
         return redirect('final_voting:ballot')
@@ -52,13 +60,15 @@ def submit_ballot(request):
         with transaction.atomic():
             ballot = Ballot.objects.select_for_update().filter(voter=request.user).first()
             if ballot and not election.allow_ballot_edits:
-                messages.error(request, 'Your final voting ballot has already been recorded.')
-                return redirect('final_voting:ballot')
-            if ballot:
-                ballot.selections.all().delete()
+                current_division_ids = set(ballot.selections.values_list('division_id', flat=True))
+                additions = [VoteSelection(ballot=ballot, division_id=division_id, candidate=candidate) for division_id, candidate in new_submissions.items() if division_id not in current_division_ids]
+                VoteSelection.objects.bulk_create(additions)
             else:
-                ballot = Ballot.objects.create(voter=request.user)
-            VoteSelection.objects.bulk_create([VoteSelection(ballot=ballot, division_id=key, candidate=value) for key, value in submitted.items()])
+                if ballot:
+                    ballot.selections.all().delete()
+                else:
+                    ballot = Ballot.objects.create(voter=request.user)
+                VoteSelection.objects.bulk_create([VoteSelection(ballot=ballot, division_id=key, candidate=value) for key, value in submitted.items()])
     except IntegrityError:
         messages.error(request, 'Your final voting ballot has already been recorded.')
         return redirect('final_voting:ballot')
@@ -70,10 +80,14 @@ def manage_view(request):
     election = Election.current()
     categories = BallotCategory.objects.prefetch_related('divisions__candidates').order_by('display_order')
     readiness = {category.pk: category_complete(category) for category in categories}
-    ready_to_approve = sum(readiness[c.pk] and not c.approved for c in categories)
+    confirmed_counts = {
+        division.pk: sum(candidate.confirmed and candidate.name.strip().casefold() != 'to be confirmed' for candidate in division.candidates.all())
+        for category in categories for division in category.divisions.all()
+    }
+    ready_to_approve = sum(c.method == 'online' and not c.approved for c in categories)
     ballots_exist = Ballot.objects.exists()
-    can_approve_all = election.status != 'closed' and bool(ready_to_approve) and (not ballots_exist or election.allow_ballot_edits)
-    return render(request, 'voting/manage.html', {'election': election, 'categories': categories, 'readiness': readiness, 'ballots_exist': ballots_exist, 'ready_to_approve': ready_to_approve, 'can_approve_all': can_approve_all})
+    can_approve_all = election.status != 'closed' and bool(ready_to_approve)
+    return render(request, 'voting/manage.html', {'election': election, 'categories': categories, 'readiness': readiness, 'confirmed_counts': confirmed_counts, 'ballots_exist': ballots_exist, 'ready_to_approve': ready_to_approve, 'can_approve_all': can_approve_all})
 
 
 @staff_member_required
@@ -88,8 +102,8 @@ def manage_action(request):
     if action == 'candidate_save':
         candidate = get_object_or_404(Candidate, pk=candidate_id) if candidate_id else None
         division = candidate.division if candidate else get_object_or_404(BallotDivision, pk=division_id)
-        if (election.status == 'open' and division.category.approved) or (candidate and candidate.selections.exists()):
-            messages.error(request, 'Candidates on a published category or recorded vote cannot be changed.')
+        if candidate and (candidate.selections.exists() or (election.status == 'open' and division.category.approved)):
+            messages.error(request, 'Existing candidates on a published category or recorded vote cannot be changed. Add a new candidate instead.')
             return redirect('final_voting:manage')
         name = request.POST.get('name', '').strip()
         if not name:
@@ -120,31 +134,68 @@ def manage_action(request):
         else:
             messages.error(request, 'Category cannot be approved until all required candidates are confirmed and complete.')
     elif action == 'approve_all':
-        ballots_exist = Ballot.objects.exists()
-        if election.status == 'closed' or (ballots_exist and not election.allow_ballot_edits):
-            messages.error(request, 'Bulk approval is unavailable after voting closes or when recorded ballots are locked.')
+        if election.status == 'closed':
+            messages.error(request, 'Categories cannot be approved after voting closes.')
             return redirect('final_voting:manage')
-        candidates = list(BallotCategory.objects.filter(method='online').order_by('display_order'))
-        complete = [category for category in candidates if category_complete(category)]
-        if not complete:
-            messages.error(request, 'There are no complete online categories to approve yet.')
+        categories = BallotCategory.objects.filter(method='online', approved=False)
+        count = categories.count()
+        if not count:
+            messages.info(request, 'All online categories are already approved.')
             return redirect('final_voting:manage')
-        BallotCategory.objects.filter(pk__in=[category.pk for category in complete]).update(approved=True)
-        newly_approved = sum(not category.approved for category in complete)
-        detail = f'Approved {newly_approved} complete online categories in bulk.'
+        categories.update(approved=True)
+        detail = f'Approved {count} online categories in one action, including categories still awaiting confirmed names.'
+    elif action == 'category_add':
+        if election.status == 'closed':
+            messages.error(request, 'Categories cannot be added while voting is closed.')
+            return redirect('final_voting:manage')
+        name = request.POST.get('name', '').strip()
+        label = request.POST.get('division_label', '').strip() or 'Candidates'
+        try:
+            required_candidates = int(request.POST.get('required_candidates', '4'))
+        except ValueError:
+            required_candidates = 0
+        if not name or required_candidates < 1 or required_candidates > 50:
+            messages.error(request, 'Enter a category name and a required candidate count from 1 to 50.')
+            return redirect('final_voting:manage')
+        if BallotCategory.objects.filter(name__iexact=name).exists():
+            messages.error(request, 'A category with that name already exists.')
+            return redirect('final_voting:manage')
+        order = (BallotCategory.objects.order_by('-display_order').values_list('display_order', flat=True).first() or 0) + 1
+        category = BallotCategory.objects.create(
+            name=name,
+            display_order=order,
+            method='online',
+            approved=election.status in ('ready', 'open'),
+        )
+        BallotDivision.objects.create(category=category, label=label, required_candidates=required_candidates)
+        detail = f'Added online category {category.name}'
+    elif action == 'division_add':
+        if election.status == 'closed':
+            messages.error(request, 'Divisions cannot be added while voting is closed.')
+            return redirect('final_voting:manage')
+        category = get_object_or_404(BallotCategory, pk=category_id, method='online')
+        label = request.POST.get('division_label', '').strip()
+        try:
+            required_candidates = int(request.POST.get('required_candidates', '4'))
+        except ValueError:
+            required_candidates = 0
+        if required_candidates < 1 or required_candidates > 50:
+            messages.error(request, 'Required candidate count must be from 1 to 50.')
+            return redirect('final_voting:manage')
+        try:
+            BallotDivision.objects.create(category=category, label=label, required_candidates=required_candidates)
+        except IntegrityError:
+            messages.error(request, 'That division already exists in this category.')
+            return redirect('final_voting:manage')
+        detail = f'Added division {label or "Candidates"} to {category.name}'
     elif action == 'toggle_edits':
         election.allow_ballot_edits = request.POST.get('enabled') == 'true'
         election.save(update_fields=['allow_ballot_edits'])
         detail = f'Ballot edit policy set to {election.allow_ballot_edits}'
     elif action in ('draft', 'ready', 'open', 'close', 'reopen'):
-        if action in ('ready', 'open', 'reopen'):
-            invalid = [c.name for c in BallotCategory.objects.filter(method='online') if c.approved and not category_ready(c)]
-            if invalid:
-                messages.error(request, 'Approved ballot includes incomplete categories: ' + ', '.join(invalid))
-                return redirect('final_voting:manage')
         if action == 'ready':
             if not BallotCategory.objects.filter(method='online', approved=True).exists():
-                messages.error(request, 'Approve at least one complete category before marking the ballot ready.')
+                messages.error(request, 'Approve the online categories before marking the ballot ready.')
                 return redirect('final_voting:manage')
             election.status = 'ready'
         elif action in ('open', 'reopen'):
@@ -158,7 +209,7 @@ def manage_action(request):
                 messages.error(request, 'Reopening voting requires explicit confirmation.')
                 return redirect('final_voting:manage')
             if action == 'open' and not BallotCategory.objects.filter(method='online', approved=True).exists():
-                messages.error(request, 'Approve at least one complete category before opening voting.')
+                messages.error(request, 'Approve the online categories before opening voting.')
                 return redirect('final_voting:manage')
             election.status, election.opened_at = 'open', timezone.now()
             election.approved_by, election.approved_at = request.user, timezone.now()
@@ -168,10 +219,10 @@ def manage_action(request):
         detail = f'Election status changed to {election.status}'
     if detail:
         VotingAudit.objects.create(actor=request.user, action=action.upper(), details=detail)
-        if action == 'approve_all' and Ballot.objects.exists():
-            messages.warning(request, f'{detail} Existing voters can revisit their ballots to add selections for the newly approved categories.')
-        elif action == 'approve_all':
-            messages.success(request, f'{detail} Incomplete categories remain unpublished.')
+        if action == 'approve_all':
+            messages.success(request, f'{detail} Categories appear on the voter ballot as soon as each division has enough confirmed candidates.')
+        elif action in ('category_add', 'division_add'):
+            messages.success(request, f'{detail}. Add candidate names below; new categories added after approval are approved automatically.')
         else:
             messages.success(request, 'Final voting management updated.')
     return redirect('final_voting:manage')
